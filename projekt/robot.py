@@ -1,5 +1,4 @@
 import spade
-import asyncio
 import json
 from pathfinding import astar
 from skladiste import SKLADISTE_MAPA
@@ -38,8 +37,6 @@ class AgentRobot(spade.agent.Agent):
         fsm.add_transition(source=ST_KRETANJE_PO_PAKET, dest=ST_CEKANJE_NA_PUT)
         fsm.add_transition(source=ST_KRETANJE_DO_ODLAGALISTA, dest=ST_CEKANJE_ZADATKA)
         fsm.add_transition(source=ST_KRETANJE_DO_ODLAGALISTA, dest=ST_CEKANJE_NA_PUT)
-        fsm.add_transition(source=ST_CEKANJE_NA_PUT, dest=ST_KRETANJE_PO_PAKET)
-        fsm.add_transition(source=ST_CEKANJE_NA_PUT, dest=ST_KRETANJE_DO_ODLAGALISTA)
 
         self.add_behaviour(fsm)
 
@@ -55,20 +52,21 @@ class FSMBehaviour(spade.behaviour.FSMBehaviour):
 class StanjeCekanjaZadatka(spade.behaviour.State):
     """Stanje u kojem robot traži novi zadatak od Dispečera."""
     async def run(self):
-        msg = spade.message.Message(to=self.agent.dispecer_jid, body="REQUEST_TASK")
+        print(f"[{self.agent.jid}] Tražim novi zadatak od dispečera...")
+        msg = spade.message.Message(to=self.agent.dispecer_jid)
         msg.set_metadata("performative", "request")
+        msg.body = "REQUEST_TASK"
         await self.send(msg)
 
         reply = await self.receive(timeout=10)
-        if reply and reply.body:
-            data = json.loads(reply.body)
-            if "uzmi_lokacija" in data:
-                self.agent.trenutni_zadatak = data
-                self.set_next_state(ST_KRETANJE_PO_PAKET)
-            else:
-                print(f"[{self.agent.jid}] Nema više zadataka. Gasim se.")
+        if reply and reply.metadata.get("performative") == "inform":
+            self.agent.trenutni_zadatak = json.loads(reply.body)
+            print(f"[{self.agent.jid}] Dobio zadatak: {self.agent.trenutni_zadatak}")
+            self.set_next_state(ST_KRETANJE_PO_PAKET)
         else:
-            print(f"[{self.agent.jid}] Nisam dobio odgovor od dispečera. Pokušavam ponovo.")
+            print(f"[{self.agent.jid}] Nema zadatka, čekam...")
+            await asyncio.sleep(2)
+            self.set_next_state(ST_CEKANJE_ZADATKA)
 
 class StanjeKretanja(spade.behaviour.State):
     """
@@ -77,18 +75,20 @@ class StanjeKretanja(spade.behaviour.State):
     """
     async def run(self):
         if self.current_state == ST_KRETANJE_PO_PAKET:
-            start = self.agent.pozicija
             cilj = tuple(self.agent.trenutni_zadatak['uzmi_lokacija'])
         else:
-            start = self.agent.pozicija
             cilj = tuple(self.agent.trenutni_zadatak['odnesi_lokacija'])
 
+        start = self.agent.pozicija
+        print(f"[{self.agent.jid}] Planiram putanju od {start} do {cilj}")
         putanja = astar(SKLADISTE_MAPA, start, cilj)
         if not putanja:
+            print(f"[{self.agent.jid}] Nema putanje do cilja {cilj}. Čekam...")
             self.agent.ciljni_state_nakon_cekanja = self.current_state
             self.set_next_state(ST_CEKANJE_NA_PUT)
             return
 
+        # Zahtjev za rezervaciju putanje
         putanja_s_vremenom = [(p[0], p[1], t) for t, p in enumerate(putanja, start=1)]
         msg_body = json.dumps({"tip": "PATH_RESERVATION_REQUEST", "putanja": putanja_s_vremenom})
         msg = spade.message.Message(to=self.agent.dispecer_jid, body=msg_body)
@@ -96,30 +96,27 @@ class StanjeKretanja(spade.behaviour.State):
         await self.send(msg)
 
         reply = await self.receive(timeout=10)
-        if reply:
-            if reply.metadata.get("performative") == "confirm":
-                for korak_pozicija in putanja[1:]:
-                    self.agent.pozicija = korak_pozicija
-                    self.agent.shared_state.azuriraj_poziciju_robota(str(self.agent.jid), self.agent.pozicija)
-                    await asyncio.sleep(0.3)
-
-                if self.current_state == ST_KRETANJE_PO_PAKET:
-                    self.set_next_state(ST_KRETANJE_DO_ODLAGALISTA)
-                else:
-                    self.agent.shared_state.azuriraj_status_poruku(f"Robot {self.agent.jid.localpart} je završio zadatak i slobodan je.")
-                    self.set_next_state(ST_CEKANJE_ZADATKA)
+        if reply and reply.metadata.get("performative") == "confirm":
+            print(f"[{self.agent.jid}] Rezervacija potvrđena, krećem se...")
+            for korak_pozicija in putanja[1:]:
+                print(f"[{self.agent.jid}] Krećem se na {korak_pozicija}")
+                self.agent.pozicija = korak_pozicija
+                self.agent.shared_state.azuriraj_poziciju_robota(str(self.agent.jid), self.agent.pozicija)
+                await asyncio.sleep(0.3)
+            if self.current_state == ST_KRETANJE_PO_PAKET:
+                self.set_next_state(ST_KRETANJE_DO_ODLAGALISTA)
             else:
-                self.agent.ciljni_state_nakon_cekanja = self.current_state
-                self.set_next_state(ST_CEKANJE_NA_PUT)
+                print(f"[{self.agent.jid}] Zadatak završen, tražim novi.")
+                self.set_next_state(ST_CEKANJE_ZADATKA)
         else:
+            print(f"[{self.agent.jid}] Rezervacija odbijena ili nema odgovora, čekam...")
             self.agent.ciljni_state_nakon_cekanja = self.current_state
             self.set_next_state(ST_CEKANJE_NA_PUT)
 
 class StanjeCekanjaNaPut(spade.behaviour.State):
     """Stanje u koje robot ulazi kada je putanja odbijena. Čeka kratko vrijeme prije novog pokušaja."""
     async def run(self):
-        vrijeme_cekanja = 2
-        poruka_cekanja = f"Robot {self.agent.jid.localpart} čeka jer je put zauzet."
-        self.agent.shared_state.azuriraj_status_poruku(poruka_cekanja)
-        await asyncio.sleep(vrijeme_cekanja)
+        print(f"[{self.agent.jid}] Putanja zauzeta, čekam...")
+      
+        await asyncio.sleep(2)
         self.set_next_state(self.agent.ciljni_state_nakon_cekanja)
